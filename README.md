@@ -1,12 +1,15 @@
-[![cargo version](https://img.shields.io/crates/v/atomic_enum.svg)](https://crates.io/crates/atomic_enum) 
+[![cargo version](https://img.shields.io/crates/v/atomic_enum.svg)](https://crates.io/crates/atomic_enum)
 [![docs.rs version](https://img.shields.io/docsrs/atomic_enum)](https://docs.rs/atomic_enum/latest/atomic_enum/)
 # atomic_enum
 
 An attribute to create an atomic wrapper around a C-style enum.
 
-Internally, the generated wrapper uses an `AtomicUsize` to store the value.
+Internally, the generated wrapper uses an `AtomicT` to store the value.
 The atomic operations have the same semantics as the equivalent operations
-of `AtomicUsize`.
+of `AtomicT`.
+
+`AtomicT` is `AtomicUsize` by default
+or another atomic variant based on the enum's `repr`.
 
 # Example
 ```rust

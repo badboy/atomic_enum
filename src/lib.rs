@@ -16,9 +16,12 @@
 
 //! An attribute to create an atomic wrapper around a C-style enum.
 //!
-//! Internally, the generated wrapper uses an `AtomicUsize` to store the value.
+//! Internally, the generated wrapper uses an `AtomicT` to store the value.
 //! The atomic operations have the same semantics as the equivalent operations
-//! of `AtomicUsize`.
+//! of `AtomicT`.
+//!
+//! `AtomicT` is `AtomicUsize` by default
+//! or another atomic variant based on the enum's `repr`.
 //!
 //! # Example
 //!
@@ -44,9 +47,12 @@
 //! The crate can be used in a `#[no_std]` environment.
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{quote, quote_spanned};
-use syn::{parse_macro_input, spanned::Spanned, Attribute, Ident, ItemEnum, Variant, Visibility};
+use syn::{
+    parse_macro_input, spanned::Spanned, Attribute, Ident, ItemEnum, Meta, NestedMeta, Variant,
+    Visibility,
+};
 
 fn enum_definition<'a>(
     attrs: impl IntoIterator<Item = Attribute>,
@@ -66,50 +72,63 @@ fn enum_definition<'a>(
     }
 }
 
-fn atomic_enum_definition(vis: &Visibility, ident: &Ident, atomic_ident: &Ident) -> TokenStream2 {
+fn atomic_enum_definition(
+    vis: &Visibility,
+    ident: &Ident,
+    atomic_ident: &Ident,
+    atomic_target_type: &Ident,
+) -> TokenStream2 {
     let atomic_ident_docs = format!(
-        "A wrapper around [`{0}`] which can be safely shared between threads.
+        "A wrapper around [`{ident}`] which can be safely shared between threads.
 
-This type uses an `AtomicUsize` to store the enum value.
+This type uses an `{atomic_target_type}` to store the enum value.
 
-[`{0}`]: enum.{0}.html",
-        ident
+[`{ident}`]: enum.{ident}.html"
     );
 
     quote! {
         #[doc = #atomic_ident_docs]
-        #vis struct #atomic_ident(core::sync::atomic::AtomicUsize);
+        #vis struct #atomic_ident(core::sync::atomic::#atomic_target_type);
     }
 }
 
-fn enum_to_usize(ident: &Ident) -> TokenStream2 {
+fn enum_to_type(ident: &Ident, target_type: &Ident) -> TokenStream2 {
+    let name = Ident::new(&format!("to_{target_type}"), Span::call_site());
     quote! {
-        const fn to_usize(val: #ident) -> usize {
-            val as usize
+        const fn #name(val: #ident) -> #target_type {
+            val as #target_type
         }
     }
 }
 
-fn enum_from_usize(ident: &Ident, variants: impl IntoIterator<Item = Variant>) -> TokenStream2 {
+fn enum_from_type(
+    ident: &Ident,
+    variants: impl IntoIterator<Item = Variant>,
+    target_type: &Ident,
+) -> TokenStream2 {
     let variants_with_const_names: Vec<_> = variants
         .into_iter()
         .map(|v| v.ident)
         .map(|id| {
-            let c_id = Ident::new(&format!("USIZE_{}", &id), id.span());
+            let c_id = Ident::new(
+                &format!("{}_{}", target_type.to_string().to_uppercase(), &id),
+                id.span(),
+            );
             (id, c_id)
         })
         .collect();
 
     let variant_consts = variants_with_const_names
         .iter()
-        .map(|(id, c_id)| quote! { const #c_id: usize = #ident::#id as usize; });
+        .map(|(id, c_id)| quote! { const #c_id: #target_type = #ident::#id as #target_type; });
 
     let variants_back = variants_with_const_names
         .iter()
         .map(|(id, c_id)| quote! { #c_id => #ident::#id, });
 
+    let name = Ident::new(&format!("from_{target_type}"), Span::call_site());
     quote! {
-        fn from_usize(val: usize) -> #ident {
+        fn #name(val: #target_type) -> #ident {
             #![allow(non_upper_case_globals)]
             #(#variant_consts)*
 
@@ -121,51 +140,59 @@ fn enum_from_usize(ident: &Ident, variants: impl IntoIterator<Item = Variant>) -
     }
 }
 
-fn atomic_enum_new(ident: &Ident, atomic_ident: &Ident) -> TokenStream2 {
+fn atomic_enum_new(
+    ident: &Ident,
+    atomic_ident: &Ident,
+    target_type: &Ident,
+    atomic_target_type: &Ident,
+) -> TokenStream2 {
+    let to = Ident::new(&format!("to_{target_type}"), Span::call_site());
     let atomic_ident_docs = format!(
-        "Creates a new atomic [`{0}`].
+        "Creates a new atomic [`{ident}`].
 
-[`{0}`]: enum.{0}.html",
-        ident
+[`{ident}`]: enum.{ident}.html"
     );
 
     quote! {
         #[doc = #atomic_ident_docs]
         pub const fn new(v: #ident) -> #atomic_ident {
-            #atomic_ident(core::sync::atomic::AtomicUsize::new(Self::to_usize(v)))
+            #atomic_ident(core::sync::atomic::#atomic_target_type::new(Self::#to(v)))
         }
     }
 }
 
-fn atomic_enum_into_inner(ident: &Ident) -> TokenStream2 {
+fn atomic_enum_into_inner(ident: &Ident, target_type: &Ident) -> TokenStream2 {
+    let from = Ident::new(&format!("from_{target_type}"), Span::call_site());
     quote! {
         /// Consumes the atomic and returns the contained value.
         ///
         /// This is safe because passing self by value guarantees that no other threads are concurrently accessing the atomic data.
         pub fn into_inner(self) -> #ident {
-            Self::from_usize(self.0.into_inner())
+            Self::#from(self.0.into_inner())
         }
     }
 }
 
-fn atomic_enum_set(ident: &Ident) -> TokenStream2 {
+fn atomic_enum_set(ident: &Ident, target_type: &Ident) -> TokenStream2 {
+    let to = Ident::new(&format!("to_{target_type}"), Span::call_site());
     quote! {
         /// Sets the value of the atomic without performing an atomic operation.
         ///
         /// This is safe because the mutable reference guarantees that no other threads are concurrently accessing the atomic data.
         pub fn set(&mut self, v: #ident) {
-            *self.0.get_mut() = Self::to_usize(v);
+            *self.0.get_mut() = Self::#to(v);
         }
     }
 }
 
-fn atomic_enum_get(ident: &Ident) -> TokenStream2 {
+fn atomic_enum_get(ident: &Ident, target_type: &Ident) -> TokenStream2 {
+    let from = Ident::new(&format!("from_{target_type}"), Span::call_site());
     quote! {
         /// Gets the value of the atomic without performing an atomic operation.
         ///
         /// This is safe because the mutable reference guarantees that no other threads are concurrently accessing the atomic data.
         pub fn get(&mut self) -> #ident {
-            Self::from_usize(*self.0.get_mut())
+            Self::#from(*self.0.get_mut())
         }
     }
 }
@@ -183,7 +210,8 @@ fn atomic_enum_swap_mut(ident: &Ident) -> TokenStream2 {
     }
 }
 
-fn atomic_enum_load(ident: &Ident) -> TokenStream2 {
+fn atomic_enum_load(ident: &Ident, target_type: &Ident) -> TokenStream2 {
+    let name = Ident::new(&format!("from_{target_type}"), Span::call_site());
     quote! {
         /// Loads a value from the atomic.
         ///
@@ -193,12 +221,13 @@ fn atomic_enum_load(ident: &Ident) -> TokenStream2 {
         ///
         /// Panics if order is `Release` or `AcqRel`.
         pub fn load(&self, order: core::sync::atomic::Ordering) -> #ident {
-            Self::from_usize(self.0.load(order))
+            Self::#name(self.0.load(order))
         }
     }
 }
 
-fn atomic_enum_store(ident: &Ident) -> TokenStream2 {
+fn atomic_enum_store(ident: &Ident, target_type: &Ident) -> TokenStream2 {
+    let to = Ident::new(&format!("to_{target_type}"), Span::call_site());
     quote! {
         /// Stores a value into the atomic.
         ///
@@ -208,12 +237,14 @@ fn atomic_enum_store(ident: &Ident) -> TokenStream2 {
         ///
         /// Panics if order is `Acquire` or `AcqRel`.
         pub fn store(&self, val: #ident, order: core::sync::atomic::Ordering) {
-            self.0.store(Self::to_usize(val), order)
+            self.0.store(Self::#to(val), order)
         }
     }
 }
 
-fn atomic_enum_swap(ident: &Ident) -> TokenStream2 {
+fn atomic_enum_swap(ident: &Ident, target_type: &Ident) -> TokenStream2 {
+    let to = Ident::new(&format!("to_{target_type}"), Span::call_site());
+    let from = Ident::new(&format!("from_{target_type}"), Span::call_site());
     quote! {
         /// Stores a value into the atomic, returning the previous value.
         ///
@@ -221,12 +252,14 @@ fn atomic_enum_swap(ident: &Ident) -> TokenStream2 {
         /// All ordering modes are possible. Note that using `Acquire` makes the store part of this operation `Relaxed`,
         /// and using `Release` makes the load part `Relaxed`.
         pub fn swap(&self, val: #ident, order: core::sync::atomic::Ordering) -> #ident {
-            Self::from_usize(self.0.swap(Self::to_usize(val), order))
+            Self::#from(self.0.swap(Self::#to(val), order))
         }
     }
 }
 
-fn atomic_enum_compare_and_swap(ident: &Ident) -> TokenStream2 {
+fn atomic_enum_compare_and_swap(ident: &Ident, target_type: &Ident) -> TokenStream2 {
+    let to = Ident::new(&format!("to_{target_type}"), Span::call_site());
+    let from = Ident::new(&format!("from_{target_type}"), Span::call_site());
     quote! {
         /// Stores a value into the atomic if the current value is the same as the `current` value.
         ///
@@ -244,16 +277,18 @@ fn atomic_enum_compare_and_swap(ident: &Ident) -> TokenStream2 {
             new: #ident,
             order: core::sync::atomic::Ordering
         ) -> #ident {
-            Self::from_usize(self.0.compare_and_swap(
-                Self::to_usize(current),
-                Self::to_usize(new),
+            Self::#from(self.0.compare_and_swap(
+                Self::#to(current),
+                Self::#to(new),
                 order
             ))
         }
     }
 }
 
-fn atomic_enum_compare_exchange(ident: &Ident) -> TokenStream2 {
+fn atomic_enum_compare_exchange(ident: &Ident, target_type: &Ident) -> TokenStream2 {
+    let to = Ident::new(&format!("to_{target_type}"), Span::call_site());
+    let from = Ident::new(&format!("from_{target_type}"), Span::call_site());
     quote! {
         /// Stores a value into the atomic if the current value is the same as the `current` value.
         ///
@@ -274,18 +309,20 @@ fn atomic_enum_compare_exchange(ident: &Ident) -> TokenStream2 {
         ) -> Result<#ident, #ident> {
             self.0
                 .compare_exchange(
-                    Self::to_usize(current),
-                    Self::to_usize(new),
+                    Self::#to(current),
+                    Self::#to(new),
                     success,
                     failure
                 )
-                .map(Self::from_usize)
-                .map_err(Self::from_usize)
+                .map(Self::#from)
+                .map_err(Self::#from)
         }
     }
 }
 
-fn atomic_enum_compare_exchange_weak(ident: &Ident) -> TokenStream2 {
+fn atomic_enum_compare_exchange_weak(ident: &Ident, target_type: &Ident) -> TokenStream2 {
+    let to = Ident::new(&format!("to_{target_type}"), Span::call_site());
+    let from = Ident::new(&format!("from_{target_type}"), Span::call_site());
     quote! {
         /// Stores a value into the atomic if the current value is the same as the `current` value.
         ///
@@ -307,13 +344,13 @@ fn atomic_enum_compare_exchange_weak(ident: &Ident) -> TokenStream2 {
         ) -> Result<#ident, #ident> {
             self.0
                 .compare_exchange_weak(
-                    Self::to_usize(current),
-                    Self::to_usize(new),
+                    Self::#to(current),
+                    Self::#to(new),
                     success,
                     failure
                 )
-                .map(Self::from_usize)
-                .map_err(Self::from_usize)
+                .map(Self::#from)
+                .map_err(Self::#from)
         }
     }
 }
@@ -338,13 +375,54 @@ fn debug_impl(atomic_ident: &Ident) -> TokenStream2 {
     }
 }
 
+fn target_type<'a>(attrs: impl IntoIterator<Item = &'a Attribute>) -> Ident {
+    let mut ident = None;
+    for attr in attrs {
+        if !attr.path.is_ident("repr") {
+            continue;
+        }
+
+        let list = match attr.parse_meta() {
+            Ok(Meta::List(list)) => list,
+            Ok(_) => continue,
+            Err(e) => panic!("can't parse repr: {e}"),
+        };
+
+        for meta in list.nested {
+            match meta {
+                NestedMeta::Meta(Meta::Path(p)) => {
+                    ident = Some(p.get_ident().expect("need repr ident").clone());
+                    break;
+                }
+                _ => panic!("not supported"),
+            }
+        }
+
+        if ident.is_some() {
+            break;
+        }
+    }
+
+    ident.unwrap_or_else(|| Ident::new("usize", Span::call_site()))
+}
+
+fn atomic_target_type(typ: &Ident) -> Ident {
+    let typ = typ.to_string();
+    let f = typ[0..1].to_uppercase();
+    let rest = &typ[1..];
+    Ident::new(&format!("Atomic{f}{rest}"), Span::call_site())
+}
+
 #[proc_macro_attribute]
 /// Creates an atomic wrapper around a C-style enum.
 ///
-/// The generated type is a wrapper around `AtomicUsize` that transparently
+/// The generated type is a wrapper around `AtomicT` that transparently
 /// converts between the stored integer and the enum type. This attribute
 /// also automatically derives the `Debug`, `Copy` and `Clone` traits on
 /// the enum type.
+///
+/// `AtomicT` is `AtomicUsize` by default
+/// or another atomic variant based on the enum's `repr`.
 ///
 /// The name of the atomic type is the name of the enum type, prefixed with
 /// `Atomic`.
@@ -400,33 +478,41 @@ pub fn atomic_enum(args: TokenStream, input: TokenStream) -> TokenStream {
         }
     }
 
+    let target_type = target_type(&attrs);
+    let atomic_target_type = atomic_target_type(&target_type);
+
     // Define the enum
     let mut output = enum_definition(attrs, &vis, &ident, &variants);
 
     // Define the atomic wrapper
     let atomic_ident = parse_macro_input!(args as Option<Ident>)
-        .unwrap_or_else(|| Ident::new(&format!("Atomic{}", ident), ident.span()));
-    output.extend(atomic_enum_definition(&vis, &ident, &atomic_ident));
+        .unwrap_or_else(|| Ident::new(&format!("Atomic{ident}"), ident.span()));
+    output.extend(atomic_enum_definition(
+        &vis,
+        &ident,
+        &atomic_ident,
+        &atomic_target_type,
+    ));
 
     // Write the impl block for the atomic wrapper
-    let enum_to_usize = enum_to_usize(&ident);
-    let enum_from_usize = enum_from_usize(&ident, variants);
-    let atomic_enum_new = atomic_enum_new(&ident, &atomic_ident);
-    let atomic_enum_into_inner = atomic_enum_into_inner(&ident);
-    let atomic_enum_set = atomic_enum_set(&ident);
-    let atomic_enum_get = atomic_enum_get(&ident);
+    let enum_to_type = enum_to_type(&ident, &target_type);
+    let enum_from_type = enum_from_type(&ident, variants, &target_type);
+    let atomic_enum_new = atomic_enum_new(&ident, &atomic_ident, &target_type, &atomic_target_type);
+    let atomic_enum_into_inner = atomic_enum_into_inner(&ident, &target_type);
+    let atomic_enum_set = atomic_enum_set(&ident, &target_type);
+    let atomic_enum_get = atomic_enum_get(&ident, &target_type);
     let atomic_enum_swap_mut = atomic_enum_swap_mut(&ident);
-    let atomic_enum_load = atomic_enum_load(&ident);
-    let atomic_enum_store = atomic_enum_store(&ident);
-    let atomic_enum_swap = atomic_enum_swap(&ident);
-    let atomic_enum_compare_and_swap = atomic_enum_compare_and_swap(&ident);
-    let atomic_enum_compare_exchange = atomic_enum_compare_exchange(&ident);
-    let atomic_enum_compare_exchange_weak = atomic_enum_compare_exchange_weak(&ident);
+    let atomic_enum_load = atomic_enum_load(&ident, &target_type);
+    let atomic_enum_store = atomic_enum_store(&ident, &target_type);
+    let atomic_enum_swap = atomic_enum_swap(&ident, &target_type);
+    let atomic_enum_compare_and_swap = atomic_enum_compare_and_swap(&ident, &target_type);
+    let atomic_enum_compare_exchange = atomic_enum_compare_exchange(&ident, &target_type);
+    let atomic_enum_compare_exchange_weak = atomic_enum_compare_exchange_weak(&ident, &target_type);
 
     output.extend(quote! {
         impl #atomic_ident {
-            #enum_to_usize
-            #enum_from_usize
+            #enum_to_type
+            #enum_from_type
             #atomic_enum_new
             #atomic_enum_into_inner
             #atomic_enum_set
